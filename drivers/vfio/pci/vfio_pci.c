@@ -64,15 +64,6 @@ static bool disable_denylist;
 module_param(disable_denylist, bool, 0444);
 MODULE_PARM_DESC(disable_denylist, "Disable use of device denylist. Disabling the denylist allows binding to devices with known errata that may lead to exploitable stability or security issues when accessed by untrusted users.");
 
-static inline bool vfio_vga_disabled(struct vfio_pci_device *vdev)
-{
-#ifdef CONFIG_VFIO_PCI_VGA
-	return vdev->disable_vga;
-#else
-	return true;
-#endif
-}
-
 static bool vfio_pci_dev_in_denylist(struct pci_dev *pdev)
 {
 	switch (pdev->vendor) {
@@ -149,11 +140,6 @@ static unsigned int vfio_pci_set_vga_decode(void *opaque, bool single_vga)
 	}
 
 	return decodes;
-}
-
-static inline bool vfio_pci_is_vga(struct pci_dev *pdev)
-{
-	return (pdev->class >> 8) == PCI_CLASS_DISPLAY_VGA;
 }
 
 static void vfio_pci_probe_mmaps(struct vfio_pci_device *vdev)
