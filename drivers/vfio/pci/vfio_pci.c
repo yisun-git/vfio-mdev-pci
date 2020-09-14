@@ -793,6 +793,7 @@ int vfio_pci_register_dev_region(struct vfio_pci_device *vdev,
 
 struct vfio_devices {
 	struct vfio_device **devices;
+	struct vfio_pci_device *vdev;
 	int cur_index;
 	int max_index;
 };
@@ -2135,15 +2136,15 @@ static void vfio_pci_reflck_get(struct vfio_pci_reflck *reflck)
 
 static int vfio_pci_reflck_find(struct pci_dev *pdev, void *data)
 {
-	struct vfio_pci_reflck **preflck = data;
 	struct vfio_device *device;
-	struct vfio_pci_device *vdev;
+	struct vfio_pci_device *vdev = data;
+	struct vfio_pci_reflck **preflck = &vdev->reflck;
 
 	device = vfio_device_get_from_dev(&pdev->dev);
 	if (!device)
 		return 0;
 
-	if (pci_dev_driver(pdev) != &vfio_pci_driver) {
+	if (pci_dev_driver(pdev) != pci_dev_driver(vdev->pdev)) {
 		vfio_device_put(device);
 		return 0;
 	}
@@ -2169,7 +2170,7 @@ static int vfio_pci_reflck_attach(struct vfio_pci_device *vdev)
 
 	if (pci_is_root_bus(vdev->pdev->bus) ||
 	    vfio_pci_for_each_slot_or_bus(vdev->pdev, vfio_pci_reflck_find,
-					  &vdev->reflck, slot) <= 0)
+					  vdev, slot) <= 0)
 		vdev->reflck = vfio_pci_reflck_alloc();
 
 	mutex_unlock(&reflck_lock);
@@ -2205,7 +2206,7 @@ static int vfio_pci_get_unused_devs(struct pci_dev *pdev, void *data)
 	if (!device)
 		return -EINVAL;
 
-	if (pci_dev_driver(pdev) != &vfio_pci_driver) {
+	if (pci_dev_driver(pdev) != pci_dev_driver(devs->vdev->pdev)) {
 		vfio_device_put(device);
 		return -EBUSY;
 	}
@@ -2273,7 +2274,7 @@ static int vfio_pci_try_zap_and_vma_lock_cb(struct pci_dev *pdev, void *data)
  */
 static void vfio_pci_try_bus_reset(struct vfio_pci_device *vdev)
 {
-	struct vfio_devices devs = { .cur_index = 0 };
+	struct vfio_devices devs = { .vdev = vdev, .cur_index = 0 };
 	int i = 0, ret = -EINVAL;
 	bool slot = false;
 	struct vfio_pci_device *tmp;
@@ -2336,7 +2337,7 @@ static void __exit vfio_pci_cleanup(void)
 	vfio_pci_uninit_perm_bits();
 }
 
-static void __init vfio_pci_ids(char *ids)
+static void __init vfio_pci_ids(char *ids, struct pci_driver *driver)
 {
 	char *p, *id;
 	int rc;
@@ -2364,7 +2365,7 @@ static void __init vfio_pci_ids(char *ids)
 			continue;
 		}
 
-		rc = pci_add_dynid(&vfio_pci_driver, vendor, device,
+		rc = pci_add_dynid(driver, vendor, device,
 				   subvendor, subdevice, class, class_mask, 0);
 		if (rc)
 			pr_warn("failed to add dynamic id [%04x:%04x[%04x:%04x]] class %#08x/%08x (%d)\n",
@@ -2391,7 +2392,7 @@ static int __init vfio_pci_init(void)
 	if (ret)
 		goto out_driver;
 
-	vfio_pci_ids(ids);
+	vfio_pci_ids(ids, &vfio_pci_driver);
 
 	if (disable_denylist)
 		pr_warn("device denylist disabled.\n");
