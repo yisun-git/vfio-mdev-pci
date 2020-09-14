@@ -124,9 +124,14 @@ struct vfio_pci_device {
 	bool			extended_caps;
 	bool			bardirty;
 	bool			has_vga;
+#ifdef CONFIG_VFIO_PCI_VGA
+	bool			disable_vga;
+#endif
 	bool			needs_reset;
 	bool			nointx;
+	bool			nointxmask;
 	bool			needs_pm_restore;
+	bool			disable_idle_d3;
 	struct pci_saved_state	*pci_saved_state;
 	struct pci_saved_state	*pm_save;
 	struct vfio_pci_reflck	*reflck;
@@ -149,6 +154,9 @@ struct vfio_pci_device {
 #define is_msix(vdev) (vdev->irq_type == VFIO_PCI_MSIX_IRQ_INDEX)
 #define is_irq_none(vdev) (!(is_intx(vdev) || is_msi(vdev) || is_msix(vdev)))
 #define irq_is(vdev, type) (vdev->irq_type == type)
+
+extern void vfio_pci_refresh_config(struct vfio_pci_device *vdev,
+				bool nointxmask, bool disable_idle_d3);
 
 extern void vfio_pci_intx_mask(struct vfio_pci_device *vdev);
 extern void vfio_pci_intx_unmask(struct vfio_pci_device *vdev);
