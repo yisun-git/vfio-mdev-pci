@@ -104,7 +104,7 @@ struct vfio_pci_device {
 	bool			disable_idle_d3;
 };
 
-extern const struct pci_error_handlers vfio_err_handlers;
+extern const struct pci_error_handlers vfio_pci_err_handlers;
 
 static inline bool vfio_pci_is_vga(struct pci_dev *pdev)
 {
