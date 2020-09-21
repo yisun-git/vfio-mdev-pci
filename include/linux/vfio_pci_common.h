@@ -142,7 +142,23 @@ extern int vfio_pci_mmap(void *device_data, struct vm_area_struct *vma);
 extern void vfio_pci_request(void *device_data, unsigned int count);
 extern void vfio_pci_ids(char *ids, struct pci_driver *driver);
 extern int vfio_pci_reflck_attach(struct vfio_pci_device *vdev);
-extern void vfio_pci_reflck_put(struct vfio_pci_reflck *reflck);
+extern void vfio_pci_reflck_put(struct vfio_pci_device *vdev);
 extern void vfio_pci_probe_power_state(struct vfio_pci_device *vdev);
+extern int vfio_pci_probe_common(struct pci_dev *pdev,
+				 const struct pci_device_id *id,
+				 struct vfio_pci_device *vdev);
+extern void vfio_pci_probe_common_sec(struct pci_dev *pdev,
+				      struct vfio_pci_device *vdev);
+extern void vfio_pci_remove_common(struct pci_dev *pdev,
+				   struct vfio_pci_device *vdev);
+extern void vfio_pci_register_driver(struct pci_driver *driver);
+extern struct vfio_pci_device *get_pf_vdev(struct vfio_pci_device *vdev,
+					   struct vfio_device **pf_dev);
+extern int vfio_pci_open_common(struct vfio_pci_device *vdev,
+				bool nointxmask,
+				bool disable_idle_d3,
+				bool vf_token_add);
+extern void vfio_pci_release_common(struct vfio_pci_device *vdev,
+				    bool vf_token_add);
 
 #endif /* VFIO_PCI_COMMON_H */

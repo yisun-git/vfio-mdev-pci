@@ -104,66 +104,11 @@ static bool vfio_pci_is_denylisted(struct pci_dev *pdev)
 
 static struct pci_driver vfio_pci_driver;
 
-static struct vfio_pci_device *get_pf_vdev(struct vfio_pci_device *vdev,
-					   struct vfio_device **pf_dev)
-{
-	struct pci_dev *physfn = pci_physfn(vdev->pdev);
-
-	if (!vdev->pdev->is_virtfn)
-		return NULL;
-
-	*pf_dev = vfio_device_get_from_dev(&physfn->dev);
-	if (!*pf_dev)
-		return NULL;
-
-	if (pci_dev_driver(physfn) != &vfio_pci_driver) {
-		vfio_device_put(*pf_dev);
-		return NULL;
-	}
-
-	return vfio_device_data(*pf_dev);
-}
-
-static void vfio_pci_vf_token_user_add(struct vfio_pci_device *vdev, int val)
-{
-	struct vfio_device *pf_dev;
-	struct vfio_pci_device *pf_vdev = get_pf_vdev(vdev, &pf_dev);
-
-	if (!pf_vdev)
-		return;
-
-	mutex_lock(&pf_vdev->vf_token->lock);
-	pf_vdev->vf_token->users += val;
-	WARN_ON(pf_vdev->vf_token->users < 0);
-	mutex_unlock(&pf_vdev->vf_token->lock);
-
-	vfio_device_put(pf_dev);
-}
-
 static void vfio_pci_release(void *device_data)
 {
 	struct vfio_pci_device *vdev = device_data;
 
-	mutex_lock(&vdev->reflck->lock);
-
-	if (!(--vdev->refcnt)) {
-		vfio_pci_vf_token_user_add(vdev, -1);
-		vfio_spapr_pci_eeh_release(vdev->pdev);
-		vfio_pci_disable(vdev);
-
-		mutex_lock(&vdev->igate);
-		if (vdev->err_trigger) {
-			eventfd_ctx_put(vdev->err_trigger);
-			vdev->err_trigger = NULL;
-		}
-		if (vdev->req_trigger) {
-			eventfd_ctx_put(vdev->req_trigger);
-			vdev->req_trigger = NULL;
-		}
-		mutex_unlock(&vdev->igate);
-	}
-
-	mutex_unlock(&vdev->reflck->lock);
+	vfio_pci_release_common(vdev, true);
 
 	module_put(THIS_MODULE);
 }
@@ -176,21 +121,8 @@ static int vfio_pci_open(void *device_data)
 	if (!try_module_get(THIS_MODULE))
 		return -ENODEV;
 
-	vfio_pci_refresh_config(vdev, nointxmask, disable_idle_d3);
+	ret = vfio_pci_open_common(vdev, nointxmask, disable_idle_d3, true);
 
-	mutex_lock(&vdev->reflck->lock);
-
-	if (!vdev->refcnt) {
-		ret = vfio_pci_enable(vdev);
-		if (ret)
-			goto error;
-
-		vfio_spapr_pci_eeh_open(vdev->pdev);
-		vfio_pci_vf_token_user_add(vdev, 1);
-	}
-	vdev->refcnt++;
-error:
-	mutex_unlock(&vdev->reflck->lock);
 	if (ret)
 		module_put(THIS_MODULE);
 	return ret;
@@ -352,8 +284,6 @@ static const struct vfio_device_ops vfio_pci_ops = {
 	.match		= vfio_pci_match,
 };
 
-static struct pci_driver vfio_pci_driver;
-
 static int vfio_pci_bus_notifier(struct notifier_block *nb,
 				 unsigned long action, void *data)
 {
@@ -391,22 +321,6 @@ static int vfio_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (vfio_pci_is_denylisted(pdev))
 		return -EINVAL;
 
-	if (pdev->hdr_type != PCI_HEADER_TYPE_NORMAL)
-		return -EINVAL;
-
-	/*
-	 * Prevent binding to PFs with VFs enabled, the VFs might be in use
-	 * by the host or other users.  We cannot capture the VFs if they
-	 * already exist, nor can we track VF users.  Disabling SR-IOV here
-	 * would initiate removing the VFs, which would unbind the driver,
-	 * which is prone to blocking if that VF is also in use by vfio-pci.
-	 * Just reject these PFs and let the user sort it out.
-	 */
-	if (pci_num_vf(pdev)) {
-		pci_warn(pdev, "Cannot bind to PF with SR-IOV enabled\n");
-		return -EBUSY;
-	}
-
 	group = vfio_iommu_group_get(&pdev->dev);
 	if (!group)
 		return -EINVAL;
@@ -417,20 +331,12 @@ static int vfio_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto out_group_put;
 	}
 
-	vdev->pdev = pdev;
-	vdev->irq_type = VFIO_PCI_NUM_IRQS;
-	mutex_init(&vdev->igate);
-	spin_lock_init(&vdev->irqlock);
-	mutex_init(&vdev->ioeventfds_lock);
-	INIT_LIST_HEAD(&vdev->ioeventfds_list);
-	mutex_init(&vdev->vma_lock);
-	INIT_LIST_HEAD(&vdev->vma_list);
-	init_rwsem(&vdev->memory_lock);
+	vfio_pci_probe_common(pdev, id, vdev);
+
 #ifdef CONFIG_VFIO_PCI_VGA
 	vdev->disable_vga = disable_vga;
 #endif
 	vfio_pci_refresh_config(vdev, nointxmask, disable_idle_d3);
-
 
 	ret = vfio_add_group_dev(&pdev->dev, &vfio_pci_ops, vdev);
 	if (ret)
@@ -456,34 +362,14 @@ static int vfio_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			goto out_vf_token;
 	}
 
-	if (vfio_pci_is_vga(pdev)) {
-		vga_client_register(pdev, vdev, NULL, vfio_pci_set_vga_decode);
-		vga_set_legacy_decoding(pdev,
-					vfio_pci_set_vga_decode(vdev, false));
-	}
-
-	vfio_pci_probe_power_state(vdev);
-
-	if (!vdev->disable_idle_d3) {
-		/*
-		 * pci-core sets the device power state to an unknown value at
-		 * bootup and after being removed from a driver.  The only
-		 * transition it allows from this unknown state is to D0, which
-		 * typically happens when a driver calls pci_enable_device().
-		 * We're not ready to enable the device yet, but we do want to
-		 * be able to get to D3.  Therefore first do a D0 transition
-		 * before going to D3.
-		 */
-		vfio_pci_set_power_state(vdev, PCI_D0);
-		vfio_pci_set_power_state(vdev, PCI_D3hot);
-	}
+	vfio_pci_probe_common_sec(pdev, vdev);
 
 	return ret;
 
 out_vf_token:
 	kfree(vdev->vf_token);
 out_reflck:
-	vfio_pci_reflck_put(vdev->reflck);
+	vfio_pci_reflck_put(vdev);
 out_del_group_dev:
 	vfio_del_group_dev(&pdev->dev);
 out_free:
@@ -509,27 +395,11 @@ static void vfio_pci_remove(struct pci_dev *pdev)
 		kfree(vdev->vf_token);
 	}
 
-	if (vdev->nb.notifier_call)
-		bus_unregister_notifier(&pci_bus_type, &vdev->nb);
-
-	vfio_pci_reflck_put(vdev->reflck);
-
 	vfio_iommu_group_put(pdev->dev.iommu_group, &pdev->dev);
-	kfree(vdev->region);
-	mutex_destroy(&vdev->ioeventfds_lock);
 
-	if (!vdev->disable_idle_d3)
-		vfio_pci_set_power_state(vdev, PCI_D0);
+	vfio_pci_remove_common(pdev, vdev);
 
-	kfree(vdev->pm_save);
 	kfree(vdev);
-
-	if (vfio_pci_is_vga(pdev)) {
-		vga_client_register(pdev, NULL, NULL, NULL);
-		vga_set_legacy_decoding(pdev,
-				VGA_RSRC_NORMAL_IO | VGA_RSRC_NORMAL_MEM |
-				VGA_RSRC_LEGACY_IO | VGA_RSRC_LEGACY_MEM);
-	}
 }
 
 static int vfio_pci_sriov_configure(struct pci_dev *pdev, int nr_virtfn)
@@ -587,6 +457,7 @@ static int __init vfio_pci_init(void)
 		return ret;
 
 	vfio_pci_ids(ids, &vfio_pci_driver);
+	vfio_pci_register_driver(&vfio_pci_driver);
 
 	if (disable_denylist)
 		pr_warn("device denylist disabled.\n");

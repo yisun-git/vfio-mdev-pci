@@ -1659,9 +1659,10 @@ static void vfio_pci_reflck_release(struct kref *kref)
 	mutex_unlock(&reflck_lock);
 }
 
-void vfio_pci_reflck_put(struct vfio_pci_reflck *reflck)
+void vfio_pci_reflck_put(struct vfio_pci_device *vdev)
 {
-	kref_put_mutex(&reflck->kref, vfio_pci_reflck_release, &reflck_lock);
+	kref_put_mutex(&vdev->reflck->kref,
+		vfio_pci_reflck_release, &reflck_lock);
 }
 EXPORT_SYMBOL_GPL(vfio_pci_reflck_put);
 
@@ -1844,6 +1845,193 @@ void vfio_pci_ids(char *ids, struct pci_driver *driver)
 	}
 }
 EXPORT_SYMBOL_GPL(vfio_pci_ids);
+
+int vfio_pci_probe_common(struct pci_dev *pdev,
+			  const struct pci_device_id *id,
+			  struct vfio_pci_device *vdev)
+{
+	if (pdev->hdr_type != PCI_HEADER_TYPE_NORMAL)
+		return -EINVAL;
+
+	/*
+	 * Prevent binding to PFs with VFs enabled, the VFs might be in use
+	 * by the host or other users.  We cannot capture the VFs if they
+	 * already exist, nor can we track VF users.  Disabling SR-IOV here
+	 * would initiate removing the VFs, which would unbind the driver,
+	 * which is prone to blocking if that VF is also in use by vfio-pci.
+	 * Just reject these PFs and let the user sort it out.
+	 */
+	if (pci_num_vf(pdev)) {
+		pci_warn(pdev, "Cannot bind to PF with SR-IOV enabled\n");
+		return -EBUSY;
+	}
+
+	vdev->pdev = pdev;
+	vdev->irq_type = VFIO_PCI_NUM_IRQS;
+	mutex_init(&vdev->igate);
+	spin_lock_init(&vdev->irqlock);
+	mutex_init(&vdev->ioeventfds_lock);
+	INIT_LIST_HEAD(&vdev->ioeventfds_list);
+	mutex_init(&vdev->vma_lock);
+	INIT_LIST_HEAD(&vdev->vma_list);
+	init_rwsem(&vdev->memory_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(vfio_pci_probe_common);
+
+void vfio_pci_probe_common_sec(struct pci_dev *pdev,
+			       struct vfio_pci_device *vdev)
+{
+	if (vfio_pci_is_vga(pdev)) {
+		vga_client_register(pdev, vdev, NULL, vfio_pci_set_vga_decode);
+		vga_set_legacy_decoding(pdev,
+					vfio_pci_set_vga_decode(vdev, false));
+	}
+
+	vfio_pci_probe_power_state(vdev);
+
+	if (!vdev->disable_idle_d3) {
+		/*
+		 * pci-core sets the device power state to an unknown value at
+		 * bootup and after being removed from a driver.  The only
+		 * transition it allows from this unknown state is to D0, which
+		 * typically happens when a driver calls pci_enable_device().
+		 * We're not ready to enable the device yet, but we do want to
+		 * be able to get to D3.  Therefore first do a D0 transition
+		 * before going to D3.
+		 */
+		vfio_pci_set_power_state(vdev, PCI_D0);
+		vfio_pci_set_power_state(vdev, PCI_D3hot);
+	}
+}
+EXPORT_SYMBOL_GPL(vfio_pci_probe_common_sec);
+
+void vfio_pci_remove_common(struct pci_dev *pdev,
+			    struct vfio_pci_device *vdev)
+{
+	if (vdev->nb.notifier_call)
+		bus_unregister_notifier(&pci_bus_type, &vdev->nb);
+
+	vfio_pci_reflck_put(vdev);
+
+	kfree(vdev->region);
+	mutex_destroy(&vdev->ioeventfds_lock);
+
+	if (!vdev->disable_idle_d3)
+		vfio_pci_set_power_state(vdev, PCI_D0);
+
+	kfree(vdev->pm_save);
+
+	if (vfio_pci_is_vga(pdev)) {
+		vga_client_register(pdev, NULL, NULL, NULL);
+		vga_set_legacy_decoding(pdev,
+				VGA_RSRC_NORMAL_IO | VGA_RSRC_NORMAL_MEM |
+				VGA_RSRC_LEGACY_IO | VGA_RSRC_LEGACY_MEM);
+	}
+}
+EXPORT_SYMBOL_GPL(vfio_pci_remove_common);
+
+static struct pci_driver *vfio_pci_driver_register = NULL;
+
+void vfio_pci_register_driver(struct pci_driver *driver)
+{
+	vfio_pci_driver_register = driver;
+}
+EXPORT_SYMBOL_GPL(vfio_pci_register_driver);
+
+struct vfio_pci_device *get_pf_vdev(struct vfio_pci_device *vdev,
+				    struct vfio_device **pf_dev)
+{
+	struct pci_dev *physfn = pci_physfn(vdev->pdev);
+
+	if (!vdev->pdev->is_virtfn)
+		return NULL;
+
+	*pf_dev = vfio_device_get_from_dev(&physfn->dev);
+	if (!*pf_dev)
+		return NULL;
+
+	if (pci_dev_driver(physfn) != vfio_pci_driver_register) {
+		vfio_device_put(*pf_dev);
+		return NULL;
+	}
+
+	return vfio_device_data(*pf_dev);
+}
+EXPORT_SYMBOL_GPL(get_pf_vdev);
+
+static void vfio_pci_vf_token_user_add(struct vfio_pci_device *vdev, int val)
+{
+	struct vfio_device *pf_dev;
+	struct vfio_pci_device *pf_vdev = get_pf_vdev(vdev, &pf_dev);
+
+	if (!pf_vdev)
+		return;
+
+	mutex_lock(&pf_vdev->vf_token->lock);
+	pf_vdev->vf_token->users += val;
+	WARN_ON(pf_vdev->vf_token->users < 0);
+	mutex_unlock(&pf_vdev->vf_token->lock);
+
+	vfio_device_put(pf_dev);
+}
+
+int vfio_pci_open_common(struct vfio_pci_device *vdev,
+			 bool nointxmask,
+			 bool disable_idle_d3,
+			 bool vf_token_add)
+{
+	int ret = 0;
+
+	vfio_pci_refresh_config(vdev, nointxmask, disable_idle_d3);
+
+	mutex_lock(&vdev->reflck->lock);
+
+	if (!vdev->refcnt) {
+		ret = vfio_pci_enable(vdev);
+		if (ret)
+			goto error;
+
+		vfio_spapr_pci_eeh_open(vdev->pdev);
+		if (vf_token_add && vfio_pci_driver_register)
+			vfio_pci_vf_token_user_add(vdev, 1);
+	}
+	vdev->refcnt++;
+error:
+	mutex_unlock(&vdev->reflck->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(vfio_pci_open_common);
+
+void vfio_pci_release_common(struct vfio_pci_device *vdev,
+			     bool vf_token_add)
+{
+	mutex_lock(&vdev->reflck->lock);
+
+	if (!(--vdev->refcnt)) {
+		if (vf_token_add && vfio_pci_driver_register)
+			vfio_pci_vf_token_user_add(vdev, -1);
+		vfio_spapr_pci_eeh_release(vdev->pdev);
+		vfio_pci_disable(vdev);
+
+		mutex_lock(&vdev->igate);
+		if (vdev->err_trigger) {
+			eventfd_ctx_put(vdev->err_trigger);
+			vdev->err_trigger = NULL;
+		}
+		if (vdev->req_trigger) {
+			eventfd_ctx_put(vdev->req_trigger);
+			vdev->req_trigger = NULL;
+		}
+		mutex_unlock(&vdev->igate);
+	}
+
+	mutex_unlock(&vdev->reflck->lock);
+
+	module_put(THIS_MODULE);
+}
+EXPORT_SYMBOL_GPL(vfio_pci_release_common);
 
 static int __init vfio_pci_common_init(void)
 {
