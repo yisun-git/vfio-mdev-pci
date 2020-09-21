@@ -216,4 +216,16 @@ config SAMPLE_WATCH_QUEUE
 	  Build example userspace program to use the new mount_notify(),
 	  sb_notify() syscalls and the KEYCTL_WATCH_KEY keyctl() function.
 
+config SAMPLE_VFIO_MDEV_PCI
+	tristate "Sample driver for wrapping PCI device as a mdev"
+	select VFIO_PCI_COMMON
+	depends on VFIO_MDEV && VFIO_MDEV_DEVICE
+	help
+	  Sample driver for wrapping a PCI device as a mdev. A PCI
+	  device bound to this sample driver should follow the
+	  passthru steps for mdevs as shown in Documentation/driver-
+	  api/vfio-mediated-device.rst.
+
+	  If you don't know what to do here, say N.
+
 endif # SAMPLES

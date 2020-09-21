@@ -308,6 +308,9 @@ these two callback functions.
 Using the Sample Code
 =====================
 
+mtty
+------------------------
+
 mtty.c in samples/vfio-mdev/ directory is a sample driver program to
 demonstrate how to use the mediated device framework.
 
@@ -404,6 +407,64 @@ card.
 8. Destroy the mediated device that you created::
 
      # echo 1 > /sys/bus/mdev/devices/83b8f4f2-509f-382f-3c1e-e6bfe0fa1001/remove
+
+vfio-mdev-pci
+------------------------
+
+vfio-mdev-pci in samples/vfio-mdev/ directory is a sample driver program to
+wrap a PCI device as a mediated device. For a pci device, once bound to
+vfio-mdev-pci driver, user space access of this device will go through vfio
+mdev framework. The usage of the device follows mdev management method. e.g.
+user should create a mdev before exposing the device to user-space.
+
+Benefit of this new driver would be acting as a sample driver for recent changes
+from "vfio/mdev: IOMMU aware mediated device" patchset. Also it could be a good
+experiment driver for future device specific mdev migration support. This sample
+driver only supports singleton iommu groups, for non-singleton iommu groups,
+this sample driver doesn't work. It will fail when trying to assign the
+non-singleton iommu group to VMs.
+
+1. Build and load vfio-mdev-pci.ko module
+
+   Execute "make menuconfig" and config CONFIG_SAMPLE_VFIO_MDEV_PCI then load it
+   with following command:
+   > sudo modprobe vfio
+   > sudo modprobe vfio-pci
+   > sudo insmod samples/vfio-mdev/vfio-mdev-pci.ko
+
+2. Unbind original device driver
+
+   E.g. use following command to unbind its original driver:
+   > echo $dev_bdf > /sys/bus/pci/devices/$dev_bdf/driver/unbind
+
+3. Bind vfio-mdev-pci driver to the physical device
+
+   > echo $vend_id $dev_id > /sys/bus/pci/drivers/vfio-mdev-pci/new_id
+
+4. Check the supported mdev instances
+
+   > ls /sys/bus/pci/devices/$dev_bdf/mdev_supported_types/
+     vfio-mdev-pci-type_name
+   > ls /sys/bus/pci/devices/$dev_bdf/mdev_supported_types/\
+     vfio-mdev-pci-type_name/
+     available_instances  create  device_api  devices  name
+
+5. Create mdev on this physical device (only 1 instance)
+
+   > echo "83b8f4f2-509f-382f-3c1e-e6bfe0fa1003" > \
+     /sys/bus/pci/devices/$dev_bdf/mdev_supported_types/\
+     vfio-mdev-pci-type_name/create
+
+6. Passthru the mdev to guest
+
+   Add the following line in QEMU boot command
+    -device vfio-pci,\
+     sysfsdev=/sys/bus/mdev/devices/83b8f4f2-509f-382f-3c1e-e6bfe0fa1003
+
+7. Destroy mdev
+
+   > echo 1 > /sys/bus/mdev/devices/83b8f4f2-509f-382f-3c1e-e6bfe0fa1003/\
+     remove
 
 References
 ==========
